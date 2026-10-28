@@ -58,13 +58,19 @@ fun sendTextMessage(text: String) {
 - **TTS响应**:
    - `sentence_start`: 显示要播放的文本
    - `start`: 进入Speaking状态
-   - `stop`: 根据模式决定下一步动作
+   - `stop`: 服务端文本与音频推送完毕。注意：客户端**不可立即**停止播放或开启录音，必须异步挂起等待底层 `OpusStreamPlayer` 将所有已排队和缓冲的 PCM 音频帧完全播放完毕，并留出 300ms 混响消除时间后，再平滑切入下一轮对话。
 
 ## 3. 双向语音多轮对话流程
 
 ### 3.1 手动对话模式
 ```kotlin
 fun startListening() {
+    // 若当前正在播报，支持主动打断并切换为聆听
+    if (_state.value == ConversationState.SPEAKING) {
+        ttsWaitJob?.cancel()
+        audioManager.stopPlaying()
+        webSocketManager.sendAbort("user_interrupt")
+    }
     isAutoMode = false
     _state.value = ConversationState.LISTENING
     audioManager.startRecording()
@@ -91,9 +97,33 @@ fun startAutoConversation() {
     webSocketManager.sendStartListening("auto")
 }
 
+/**
+ * 收到服务端 TTS stop 后的异步等待机制
+ */
+private fun handleTtsStop() {
+    ttsWaitJob?.cancel()
+    ttsWaitJob = viewModelScope.launch {
+        try {
+            // 依据已写入帧数与 AudioTrack.playbackHeadPosition 精确比对，等待全部播放完成
+            audioManager.waitForPlaybackCompletion()
+            // 留出 300ms 缓冲，确保喇叭外放声波彻底衰减，避免麦克风自激录入
+            delay(300)
+        } finally {
+            audioManager.stopPlaying()
+            if (_state.value == ConversationState.SPEAKING) {
+                if (isAutoMode) {
+                    startNextRound()
+                } else {
+                    _state.value = ConversationState.IDLE
+                }
+            }
+        }
+    }
+}
+
 private fun startNextRound() {
     if (isAutoMode) {
-        // TTS结束后自动开始下一轮
+        // TTS实际播放完毕并衰减后自动开始下一轮
         _state.value = ConversationState.LISTENING
         audioManager.startRecording()
         webSocketManager.sendStartListening("auto")
@@ -102,14 +132,16 @@ private fun startNextRound() {
 ```
 
 ### 3.3 状态流转
-实现了完整的状态流转：
+实现了完整的状态流转与音频生命周期对齐：
 
-1. **IDLE → LISTENING**: 用户点击开始聆听或自动模式
-2. **LISTENING → PROCESSING**: 收到STT结果，停止录音
-3. **PROCESSING → SPEAKING**: 收到TTS start消息
-4. **SPEAKING → IDLE/LISTENING**:
-   - 手动模式：回到IDLE
-   - 自动模式：开始下一轮LISTENING
+1. **IDLE → LISTENING**: 用户点击开始聆听或自动模式建立连接
+2. **LISTENING → PROCESSING**: 收到STT结果，停止录音并等待LLM生成
+3. **PROCESSING → SPEAKING**: 收到TTS start消息，启动流式解码和扬声器外放
+4. **SPEAKING (服务端 stop 推流)**: 服务端结束生成，客户端保持 SPEAKING 状态持续播放剩余缓冲
+5. **SPEAKING → IDLE/LISTENING (实际播放完毕 + 300ms)**:
+   - 手动模式：平滑回到IDLE
+   - 自动模式：平滑切入下一轮LISTENING，重新开启麦克风录音
+   - 打断机制：任意时刻用户发言或点击打断，立即取消等待协程并清空缓冲，发送 abort 给服务端
 
 ## 4. 音频处理改进
 

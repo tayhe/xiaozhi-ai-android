@@ -111,14 +111,15 @@ flowchart TD
     阶段三 --> 阶段四
 ```
 
-### 4.1 阶段一：云端小智服务端直连验证
+### 4.1 阶段一：云端小智服务端直连验证（已全面完成并通过实测）
 1. **网络端点对接**：
    * **WebSocket 对话端点**：`wss://8989-agqw4kesptakygogg4l7hqpaei.instabox.tech/xiaozhi/v1/`
    * **视觉识别端点**：`https://8989-agqw4kesptakygogg4l7hqpaei.instabox.tech/xiaozhi/api/vision`
-2. **防覆盖策略**：
-   * 在设置界面将“OTA地址”清空，仅填入“WSS地址”，跳过 OTA 检查，直接连接云端 WSS；
-   * 或在 `ConversationViewModel.kt` 中微调 `performOtaCheck()`，确保在配置了自定义 WSS 时不被重写。
-3. **声学实测**：在小米 6X 上实测外放最大音量时的 AEC 回声消除表现，确认无误打断现象。
+2. **防覆盖策略实装**：
+   * 在 `ConversationViewModel.kt` 中完善防护，仅在本地 WSS 为空时才采纳 OTA 返回的地址，保证自建云端服务配置持久生效。
+3. **声学实测与排障**：
+   * 在小米 6X（LineageOS 21，Android 14）上完成端到端全链路双向通话验证：
+   * 麦克风录音 -> 阿里云千问 ASR 毫秒级上屏 -> Magpie mimo-v2.6-pro 大脑推理 -> 阿里云千问 TTS 流式下发 -> 底部大音量扬声器完整播放 156,960 帧（完整 6.54 秒清晰语音）-> 预留 300ms 混响消除后平滑切回录音。硬件级 AEC 工作良好，无声学自激。
 
 ### 4.2 阶段二：虚拟形象（Avatar）与口型/情感联动
 1. **Live2D 视口嵌入**：
@@ -240,3 +241,53 @@ jobs:
 2. 在 GitHub 仓库页面点击 **Actions**，观察流水线构建日志（NDK C++ 编译与 Gradle 打包通常在 2~3 分钟内完成）。
 3. 构建成功后，在 **Artifacts** 区域下载 `xiaozhi-ai-debug-apk`。
 4. 安装到小米 6X 真机后，授予麦克风与网络权限即可开始调试。
+
+---
+
+## 6. 全双工语音实战沉淀与排障手册（Troubleshooting & Lessons Learned）
+
+本章节系统性沉淀在二次开发首期过程中，围绕**小米 6X 真机、Instabox 自建小智服务端、阿里云百炼 ASR/TTS、Magpie 大模型网关**全链路联调时遇到的核心故障与解决方案。
+
+### 6.1 故障一：客户端“听不到声音 / 回答被截断”深度复盘
+* **表象特征**：手机界面显示“正在思考 -> 正在回答”，但扬声器几乎没有声音，仅仅听到短促的杂音或前 0.1 秒，紧接着界面又跳回“正在倾听...”。
+* **根本原因分析**：
+  1. **状态机提前中止错误**：小智协议中服务端下发的 `{"type":"tts", "state":"stop"}` 仅代表**服务端文本生成推流完毕**。原工程在收到该消息时立即调用了 `audioManager.stopPlaying()`，直接清空了 `AudioTrack` 硬件缓冲区并取消了解码协程（抓包和日志分析显示只播放了前 120ms，剩余 95% 的音频帧被全部丢弃）。
+  2. **录音抢断与回声自激**：原工程在调用 `stopPlaying()` 后紧接着执行了 `startNextRound()`，瞬间开启麦克风向服务端上报 `listen: start`，声学状态机直接打断了正在进行的播报并重置。
+  3. **未显式绑定扬声器外放**：Android 系统在录音源为 `VOICE_COMMUNICATION` 时会进入通话模式，默认将声音路由至机身顶部微弱的**听筒（Earpiece）**而非底部扬声器。
+* **解决方案与代码沉淀**：
+  * 在 `OpusStreamPlayer.kt` 中实现 `waitForPlaybackCompletion()`：实时累计已写入的 PCM 采样总帧数 `totalWrittenFrames`，与底层硬件播放头 `AudioTrack.playbackHeadPosition` 进行高精度比对，确保每一帧音频彻底播放到最后一毫秒。
+  * 在 `ConversationViewModel.kt` 中引入 `handleTtsStop()`：收到服务端的 TTS `stop` 事件后，异步挂起等待客户端彻底播放完，额外预留 300ms 混响衰减缓冲期，待喇叭彻底静音后再切回麦克风录音；同时保留用户随时主动打断（interrupt）功能。
+  * 在 `OpusStreamPlayer.kt` 中强制扬声器外放：显式设置 `audioManager.isSpeakerphoneOn = true`，并在 Android 12+ (API 31+) 上调用 `am.setCommunicationDevice(speakerDevice)`。
+
+### 6.2 故障二：服务端 EdgeTTS 握手失败与千问 TTS 迁移
+* **表象特征**：服务端生成了 LLM 文字并通过 WebSocket 推送了 `sentence_start`/`sentence_end`，但客户端实际上收到 0 个二进制音频帧。
+* **根本原因分析**：
+  * 微软 EdgeTTS 官方近期强化了反爬风控策略（强制校验带时间戳的 `Sec-MS-GEC` 签名头）。
+  * Go 服务端内部依赖的第三方库 `github.com/difyz9/edge-tts-go` 缺少该鉴权算法，导致与微软服务器握手抛出 `websocket: bad handshake`，进而静默丢弃音频。
+* **解决方案与配置沉淀**：
+  * 将 Instabox 服务端的 TTS 切换为内置且已打通的阿里云百炼大模型语音合成（`aliyun_qwen` / `qwen3-tts-flash`，音色 `Cherry`），与已配置的千问 ASR 共享已有的 DashScope 凭证。
+  * 实测首帧到达延迟低于 420ms，合成音质清脆自然，彻底杜绝了第三方接口失效的风险。
+
+### 6.3 故障三：流式音频传输从 Flow 到 Channel 的重构
+* **表象特征**：在快速多包突发到达时，可能出现音频分片播放乱序、跳音或协程挂起死锁。
+* **根本原因分析**：
+  * 原代码在 `EnhancedAudioManager.kt` 中使用 `_audioPlaybackFlow = MutableSharedFlow<ByteArray>()`（无缓冲配置），并且每个网络包都会启动一个新的协程并发 `emit`。在底层 `audioTrack.write` 阻塞写入时，多个并发协程恢复的顺序在 Dispatchers.IO 调度器下不保证 FIFO。
+* **解决方案与代码沉淀**：
+  * 改用无界 `Channel<ByteArray>(Channel.UNLIMITED)` 作为音频接收队列，保障严格的 FIFO 先进先出顺序；
+  * 由专一的后台消费协程按顺序逐帧取出、Opus 解码并推入 AudioTrack，彻底杜绝丢包与乱序。
+
+### 6.4 故障四：OTA 接口自动覆盖自定义配置防范
+* **表象特征**：在客户端配置了自建的 Instabox WSS 地址后，每次点击通话后会被自动重写为官方公共服务器地址。
+* **解决方案与代码沉淀**：
+  * 在 `ConversationViewModel.kt` 的 `performOtaCheck()` 中加入保护性校验：仅当本地配置的 `config.websocketUrl.isBlank()` 时才允许采纳 OTA 下发的推荐地址，保障用户自建服务的优先级。
+
+### 6.5 联调网络端点与配置速查表
+
+| 组件 / 服务 | 端点地址 / 规格 | 说明 |
+| :--- | :--- | :--- |
+| **手机载体 (Client)** | 小米 6X (`192.168.1.215:42413`) | LineageOS 21 (Android 14) / 无线调试 |
+| **小智服务端 (WSS)** | `wss://8989-agqw4kesptakygogg4l7hqpaei.instabox.tech/xiaozhi/v1/` | Instabox `esp32` 沙箱内运行 (Go 1.24) |
+| **OTA 服务端** | `https://8989-agqw4kesptakygogg4l7hqpaei.instabox.tech/xiaozhi/ota/` | 设备上报与版本校验 |
+| **语音识别 (ASR)** | DashScope `qwen3-asr-flash-realtime` (16kHz) | 原生全双工 WebSocket 长连接 |
+| **思考大脑 (LLM)** | Magpie 网关 `workbuddy/mimo-v2.6-pro` | 经 Tailscale (`100.100.1.2:3425`) 内网直连 |
+| **语音合成 (TTS)** | DashScope `qwen3-tts-flash` (`Cherry`, 24kHz) | 毫秒级端到端流式合成，替代易失效的 EdgeTTS |
