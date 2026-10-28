@@ -147,8 +147,13 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
                     Log.d(TAG, "固件版本: ${otaResponse.firmware.version}")
                     Log.d(TAG, "WebSocket URL: ${otaResponse.websocket.url}")
                     
-                    // 更新WebSocket URL（如果服务器返回了新的URL）
-                    updateWebSocketUrl(otaResponse.websocket.url)
+                    // 仅在本地未显式配置WebSocket URL时才采用OTA下发的URL，避免覆盖用户自建服务器的自定义配置
+                    if (config.websocketUrl.isBlank()) {
+                        Log.d(TAG, "本地WebSocket URL为空，采用OTA下发的URL: ${otaResponse.websocket.url}")
+                        updateWebSocketUrl(otaResponse.websocket.url)
+                    } else {
+                        Log.d(TAG, "本地已配置WebSocket URL: ${config.websocketUrl}，跳过OTA返回的URL覆盖: ${otaResponse.websocket.url}")
+                    }
                     
                     // 处理激活信息（如果是首次激活）
                     otaResponse.activation?.let { activation ->

@@ -1,0 +1,234 @@
+# 小智 Android 具身桌宠客户端选型与二次开发方案
+
+本项目文档记录了将闲置的 **小米 6X（Mi 6X）** 改造为 **AI Agent 具身桌面宠物（桌宠）** 的客户端技术选型理由、现有工程优势与源码审计、长期二次开发演进方向以及基于 GitHub Actions 的持续交付（CI/CD）自动化编译流程。
+
+---
+
+## 1. 硬件载体与系统环境
+
+* **设备型号**：小米 6X（代号：`wayne`）
+* **处理器 / GPU**：高通骁龙 660（SDM660，4×Kryo 260 Gold 2.2GHz + 4×Kryo 260 Silver 1.8GHz，Adreno 512 GPU）
+* **内存 / 存储**：4GB / 6GB LPDDR4X + 32GB / 64GB / 128GB eMMC 5.1
+* **屏幕规格**：5.99 英寸 IPS LCD，1080×2160 分辨率（18:9 比例，极佳的桌面立式纵览视口）
+* **操作系统**：`LineageOS 21.0-20250509-UNOFFICIAL-wayne`（Android 14，API Level 34）
+* **传感器与外设**：前置 20MP 摄像头（用于桌面视觉感知）、顶部降噪麦克风 + 底部主麦克风、底部单扬声器、Type-C 接口（用于桌面底座长期供电）
+
+---
+
+## 2. 仓库选型与背景分析
+
+### 2.1 选定仓库
+* **上游仓库**：[xiaoniu/xiaozhi-ai-android](https://github.com/xiaoniu/xiaozhi-ai-android)
+* **二次开发主干仓库**：[tayhe/xiaozhi-ai-android](https://github.com/tayhe/xiaozhi-ai-android)
+* **副本澄清**：社区中的 `by-kobayashi/xiaozhi-ai-android` 经代码比对，为上游 `xiaoniu` 的 1:1 镜像 Fork（未做独立提交，`ahead 0, behind 0`），二次开发统一以 `tayhe/xiaozhi-ai-android` 为主干。
+
+### 2.2 横向选型对比
+
+在小智开源生态的各类客户端中，针对“具身桌宠”这一特定形态的选型对比如下：
+
+| 评估维度 | **`xiaoniu/xiaozhi-ai-android`（选定）** | `jerrygugu/xiaozhi-android` | `TOM88812/xiaozhi-android-client` |
+| :--- | :--- | :--- | :--- |
+| **技术栈** | **Kotlin + Jetpack Compose + NDK C++** | Kotlin + Jetpack Compose + Oboe C++ | Flutter (Dart) |
+| **音频引擎** | **NDK 编译原生 Opus 1.3.1**，直接对接小智音频帧 | Oboe C++ 播放，录音链路较基础 | 依赖 Flutter 插件，多层抽象有抖动开销 |
+| **回声消除 (AEC)** | **系统级硬件 `AcousticEchoCanceler`** | 无完善封装 | 跨平台插件在部分 Android 驱动上不稳定 |
+| **UI 交互形态** | **全屏语音拟态波形球（视口中心化）** | 传统 IM 列表（聊天气泡 + 底部输入框） | 综合手机 App（多 Tab、列表、设置抽屉） |
+| **端侧 MCP 工具** | **具备规范文档与框架打桩**（需在客户端补全调度器） | 无 | 侧重 IoT 与 Dify 平台集成 |
+| **扩展桌宠阻力** | **极低**（Compose 原生模块解耦清晰，直接嵌 Live2D） | 较低（但需自行补全音频协议细节） | 较高（需跨 Dart/C FFI/Android 处理） |
+
+---
+
+## 3. 选定项目的核心技术优势与源码审计
+
+经过对工程源码各层实现的全面审计，项目的核心技术特征及实际代码状况如下：
+
+### 3.1 原生 NDK Opus 编解码与声学链路
+* **源码实现**：
+  * C++ 原生构建通过 Prefab 引入官方预编译的 `opus 1.3.1`（`com.fpliu.ndk.pkg.prefab.android.21:opus`），在 `CMakeLists.txt` 中直接链接 `opus::libopus.so`。
+  * 原生 JNI 源码位于 `app/src/main/cpp/opus_recorder.cpp`（对应 `OpusEncoder.kt`）与 `opus_decoder.cpp`（对应 `OpusDecoder.kt`）。
+  * 严格对齐小智 ESP32 服务端规范：16kHz 录音编码、24kHz 播放解码、60ms Opus 帧（每帧 960 个短整型样本），无冗余重采样开销。
+
+### 3.2 彻底解决桌面外放自扰问题（系统级 AEC 回声消除）
+* 具身桌宠需长时间依靠扬声器大音量外放，若无硬件级 AEC，扬声器声音会被麦克风录回引发误打断（Barge-in 死循环）。
+* 该项目在 `EnhancedAudioManager.kt` 中：
+  * 音频录音源显式选用 `MediaRecorder.AudioSource.VOICE_COMMUNICATION`；
+  * 基于 `record.audioSessionId` 创建并启用了系统的 `AcousticEchoCanceler` 与 `NoiseSuppressor`，免除了二次开发最复杂的底层声学回声消除算法调试。
+
+### 3.3 天然契合“桌宠视口”的全屏拟态 UI
+* 采用 Aetheric Harmony 玻璃拟态设计，布局以右上角字幕开关分为两态：
+  * `showSubtitles == false`（默认态）：展示 `CenterPanel`，中心为一个带呼吸缩放（`scale` 0.96~1.04）的 240dp 圆形拟态视口（原放置豆包头像），下方为状态文字；
+  * `showSubtitles == true`：展示气泡对话列表 `MessageList`。
+* 这种结构天然为替换 Live2D/3D 虚拟形象留出了完美插槽，无需推倒原有 UI 骨架。
+
+### 3.4 源码审计发现的预判偏差（重点排雷）
+
+> [!WARNING]
+> **排雷点 1：端侧 MCP 在客户端目前仅为“规范文档”，业务逻辑尚未真正实现**
+> * 现状：虽然仓库中包含 `doc/mcp.md` 并设计了完整的交互时序，且定义了 `WebSocketEvent.MCPMessage`，但在当前 `WebSocketManager.kt` 的 `sendHelloMessage()` 中，**并未携带 `features: {"mcp": true}`**。且 WebSocket 接收处从未派发过 `MCPMessage` 事件，`ConversationViewModel.kt` 中也没有解析 `"type": "mcp"` 的分支。
+> * 对策：阶段四若要驱动前置摄像头拍照、系统设置调控等能力，必须在客户端补充 JSON-RPC 2.0 请求响应调度器。
+
+> [!CAUTION]
+> **排雷点 2：官方 OTA 接口会自动强制覆盖用户自定义的 WebSocket URL**
+> * 现状：查阅 `ConversationViewModel.kt`，用户点击通话时会触发 `performOtaCheck()`。若配置中保留有默认官方 OTA 地址（`https://api.tenclass.net/xiaozhi/ota/`），OTA 请求成功后会执行 `updateWebSocketUrl(otaResponse.websocket.url)`，**导致用户手动填写的 Instabox 等自建 WSS 地址被瞬间冲刷覆盖**。
+> * 对策：连接自建服务时，必须将客户端设置中的 OTA 地址留空，或在 `ConversationViewModel.kt` 中增加保护逻辑：优先使用本地手动配置的 WSS，不被 OTA 强制篡改。
+
+> [!NOTE]
+> **排雷点 3：Lip-sync 缺失实时 PCM 音频振幅（Volume/RMS）数据流**
+> * 现状：`EnhancedAudioManager.kt` 解码出 PCM 后直接推送到底层 `OpusStreamPlayer` 播放，尚未向外部 StateFlow 广播音频振幅。
+> * 对策：需在 PCM 解码循环中加入 RMS 能量算法，通过 `StateFlow<Float>` 暴露给 UI / WebView 以驱动 Live2D 嘴形开合参数。
+
+---
+
+## 4. 具身桌宠二次开发演进方向（Roadmap）
+
+本项目作为二次开发底座，将按照以下四个阶段逐步升级为完整的具身桌面伴侣：
+
+```mermaid
+flowchart TD
+    subgraph 阶段一: 基础连通与防覆盖
+        A1[拉取 tayhe 仓库] --> A2[处理 OTA 地址防篡改逻辑]
+        A2 --> A3[配置 Instabox 云端小智 WSS]
+        A3 --> A4[真机验证全双工语音与硬件 AEC 效果]
+    end
+
+    subgraph 阶段二: 具身形象驱动与口型联动
+        B1[抽取 ConversationScreen 的 CenterPanel] --> B2[引入透明 WebView 运行 PixiJS + Live2D]
+        B2 --> B3[EnhancedAudioManager 暴露 PCM RMS 振幅流]
+        B3 --> B4[JSInterface 联动情绪状态机与 ParamMouthOpenY]
+    end
+
+    subgraph 阶段三: 离线远场唤醒与前台常驻
+        C1[构建 ForegroundService 常驻前台] --> C2[集成 Sherpa-ONNX 离线语音唤醒 AAR]
+        C2 --> C3[待机与通话状态的麦克风流平滑切换]
+    end
+
+    subgraph 阶段四: 物理 Agent 赋能与桌面常驻
+        D1[完善 WebSocket 握手 mcp 特性与 JSON-RPC 调度] --> D2[接入 CameraX 实现 camera.capture 拍照感知]
+        D2 --> D3[监听充电底座广播实现 Kiosk 桌面常亮]
+    end
+
+    阶段一 --> 阶段二
+    阶段二 --> 阶段三
+    阶段三 --> 阶段四
+```
+
+### 4.1 阶段一：云端小智服务端直连验证
+1. **网络端点对接**：
+   * **WebSocket 对话端点**：`wss://8989-agqw4kesptakygogg4l7hqpaei.instabox.tech/xiaozhi/v1/`
+   * **视觉识别端点**：`https://8989-agqw4kesptakygogg4l7hqpaei.instabox.tech/xiaozhi/api/vision`
+2. **防覆盖策略**：
+   * 在设置界面将“OTA地址”清空，仅填入“WSS地址”，跳过 OTA 检查，直接连接云端 WSS；
+   * 或在 `ConversationViewModel.kt` 中微调 `performOtaCheck()`，确保在配置了自定义 WSS 时不被重写。
+3. **声学实测**：在小米 6X 上实测外放最大音量时的 AEC 回声消除表现，确认无误打断现象。
+
+### 4.2 阶段二：虚拟形象（Avatar）与口型/情感联动
+1. **Live2D 视口嵌入**：
+   * 在 Compose 中将原本的 `CenterPanel` 头像区域替换为 `AndroidView`，承载本地透明背景的 `WebView`。
+   * Web 端集成成熟轻量的 `pixi-live2d-display`，模型资源内置于 `app/src/main/assets/live2d/`。
+2. **实时口型同步（Lip-sync）**：
+   * 在 `EnhancedAudioManager.kt` 解码出 PCM 数据后，增加分贝/RMS 能量计算：
+     ```kotlin
+     fun calculateRms(pcmData: ByteArray): Float {
+         var sum = 0.0
+         val sampleCount = pcmData.size / 2
+         for (i in 0 until sampleCount) {
+             val sample = (pcmData[i * 2].toInt() and 0xFF) or (pcmData[i * 2 + 1].toInt() shl 8)
+             sum += sample.toShort() * sample.toShort()
+         }
+         return kotlin.math.sqrt(sum / sampleCount).toFloat() / 32768f
+     }
+     ```
+   * 通过 `audioVolume: StateFlow<Float>` 广播能量值，通过 `@JavascriptInterface` 注入 WebGL 动态驱动 `ParamMouthOpenY`。
+3. **情绪与动作状态机**：
+   * `ConversationViewModel` 已在收到 LLM 消息时提取了 `emotion` 字段。将其结合 `ConversationState`（`LISTENING`、`PROCESSING`、`SPEAKING`、`IDLE`）透传给 WebView，触发歪头、思考、倾听或眨眼动作。
+
+### 4.3 阶段三：离线远场语音唤醒（Sherpa-ONNX）
+1. **常驻前台服务**：
+   * 创建 `XiaozhiForegroundService`，声明 `FOREGROUND_SERVICE_MICROPHONE` 权限，避免应用在后台或灭屏时被 Android 14 系统杀死。
+2. **轻量离线唤醒模型**：
+   * 接入新一代 Kaldi 轻量端侧引擎 **Sherpa-ONNX**，加载体积仅数 MB 的轻量级中文关键词检测（KWS）模型（唤醒词：“小智” / “你好小智”）。
+   * 骁龙 660 单核 CPU 占用低于 3%，发热与功耗极低。
+3. **麦克风音频流管道分发**：
+   * 待机模式：麦克风音频流独占喂给 Sherpa-ONNX；
+   * 触发唤醒后：自动平滑切换至 `EnhancedAudioManager`，发起 WebSocket 对话连接并推流。
+
+### 4.4 阶段四：物理 Agent 感知与桌面常驻适配
+1. **补全端侧 MCP 调度器**：
+   * 在 `WebSocketManager.sendHelloMessage()` 中补全 `features: {"mcp": true}`；
+   * 完善 `handleTextMessage()`，解析 `"type": "mcp"` 下的 JSON-RPC 2.0 报文；
+   * 注册本地工具清单：`self.get_device_status`（电量、亮屏、网络）、`camera.capture`（环境感知拍照）。
+2. **CameraX 视觉抓拍**：
+   * 绑定前置 20MP 摄像头，当收到服务端的 `tools/call: camera.capture` 时，静默抓拍一帧并通过小智 Vision API 上传分析。
+3. **桌面底座适配（Kiosk Mode）**：
+   * 窗口设置 `FLAG_KEEP_SCREEN_ON`，插电时保持常亮；
+   * 监听 `ACTION_POWER_CONNECTED`：插入桌面供电底座时自动唤醒主界面；断电后自动息屏降频进入低功耗监听模式。
+
+---
+
+## 5. GitHub Actions 自动化编译与持续交付
+
+为了避免在本地电脑或云端轻量容器中配置庞大的 Android NDK、CMake 及 Android SDK 构建环境（至少占用 8~12GB 磁盘），本项目全面采用 **GitHub Actions** 进行自动化云端编译。
+
+### 5.1 工作流配置文件
+项目工作流位于：[`.github/workflows/build-apk.yml`](../.github/workflows/build-apk.yml)
+
+核心构建脚本（已针对 Runner 环境预装 NDK 动态适配优化）：
+
+```yaml
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: # 支持在 GitHub 网页手动点击触发构建
+
+jobs:
+  build:
+    name: Assemble Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      # 动态绑定 Runner 预装的最新 Android NDK，避免固定版本路径失效
+      - name: Configure Android NDK
+        run: |
+          LATEST_NDK=$(ls -d $ANDROID_SDK_ROOT/ndk/* 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$LATEST_NDK" ]; then
+            echo "Found Android NDK at: $LATEST_NDK"
+            echo "ANDROID_NDK_HOME=$LATEST_NDK" >> $GITHUB_ENV
+            echo "ndk.dir=$LATEST_NDK" >> local.properties
+          fi
+
+      - name: Grant Execute Permission to Gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaozhi-ai-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 7
+```
+
+### 5.2 编译与真机部署步骤
+1. 将本地修改推送至 [tayhe/xiaozhi-ai-android](https://github.com/tayhe/xiaozhi-ai-android)。
+2. 在 GitHub 仓库页面点击 **Actions**，观察流水线构建日志（NDK C++ 编译与 Gradle 打包通常在 2~3 分钟内完成）。
+3. 构建成功后，在 **Artifacts** 区域下载 `xiaozhi-ai-debug-apk`。
+4. 安装到小米 6X 真机后，授予麦克风与网络权限即可开始调试。

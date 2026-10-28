@@ -38,3 +38,5 @@ https://api.tenclass.net/xiaozhi/ota/
 - [MCP协议](./doc/mcp.md) - MCP工具调用协议
 - [OTA接口文档](./doc/OTA%20接口文档.pdf) - OTA接口文档（[线上版](https://ccnphfhqs21z.feishu.cn/wiki/FjW6wZmisimNBBkov6OcmfvknVd)）
 - [通信协议：Websocket连接](./doc/通信协议：Websocket%20连接.pdf.pdf) - 通信协议：Websocket连接（[线上版](https://ccnphfhqs21z.feishu.cn/wiki/M0XiwldO9iJwHikpXD5cEx71nKh)）
+- [编译与打包](./doc/build-apk.md) - GitHub Actions 自动化编译与 APK 获取指南
+- [具身桌宠二次开发方案](./doc/desktop-pet.md) - 改造小米 6X 具身桌宠的技术选型、源码审计与四阶段路线图
