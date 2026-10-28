@@ -29,7 +29,7 @@ class OpusDecoder(
 
     // 使用协程进行解码，运行在 IO 线程
     suspend fun decode(opusData: ByteArray): ByteArray? = withContext(Dispatchers.IO) {
-        val maxPcmSize = frameSize * channels * 2 // 16-bit PCM
+        val maxPcmSize = maxOf(frameSize * channels * 2, 3840) // 确保足以容纳任何 Opus 帧 (up to 120ms at 16kHz)
         val pcmBuffer = ByteArray(maxPcmSize)
 
         val decodedBytes = nativeDecodeBytes(

@@ -5,8 +5,9 @@ import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.receiveAsFlow
 import okhttp3.*
 import okio.ByteString
 import java.util.concurrent.TimeUnit
@@ -53,8 +54,8 @@ class WebSocketManager(private val context: Context) {
     private var lastDeviceId: String? = null
     private var lastToken: String? = null
 
-    private val _events = MutableSharedFlow<WebSocketEvent>(replay = 1)
-    val events: SharedFlow<WebSocketEvent> = _events
+    private val _eventChannel = Channel<WebSocketEvent>(Channel.UNLIMITED)
+    val events: Flow<WebSocketEvent> = _eventChannel.receiveAsFlow()
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(CONNECT_TIMEOUT, TimeUnit.SECONDS)
@@ -102,34 +103,41 @@ class WebSocketManager(private val context: Context) {
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 Log.d(TAG, "收到文本消息: $text")
-                scope.launch {
-                    handleTextMessage(text)
-                    _events.emit(WebSocketEvent.TextMessage(text))
+                try {
+                    val json = gson.fromJson(text, JsonObject::class.java)
+                    val type = json.get("type")?.asString
+                    if (type == "hello") {
+                        handleHelloResponse(json)
+                    } else if (type == "mcp") {
+                        _eventChannel.trySend(WebSocketEvent.MCPMessage(text))
+                    } else {
+                        _eventChannel.trySend(WebSocketEvent.TextMessage(text))
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "解析文本消息失败", e)
+                    _eventChannel.trySend(WebSocketEvent.TextMessage(text))
                 }
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                Log.d(TAG, "收到二进制消息，长度: ${bytes.size}")
-                scope.launch {
-                    _events.emit(WebSocketEvent.BinaryMessage(bytes.toByteArray()))
-                }
+                _eventChannel.trySend(WebSocketEvent.BinaryMessage(bytes.toByteArray()))
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "WebSocket正在关闭: $code - $reason")
+                _eventChannel.trySend(WebSocketEvent.Disconnected)
                 reconnectAfterDisconnect()
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "WebSocket已关闭: $code - $reason")
+                _eventChannel.trySend(WebSocketEvent.Disconnected)
                 reconnectAfterDisconnect()
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.e(TAG, "WebSocket连接失败", t)
-                scope.launch {
-                    _events.emit(WebSocketEvent.Error("连接失败"))
-                }
+                _eventChannel.trySend(WebSocketEvent.Error("连接失败: ${t.message}"))
                 reconnectAfterDisconnect()
             }
         })
@@ -189,20 +197,12 @@ class WebSocketManager(private val context: Context) {
             isHandshakeComplete = true
             helloTimeoutJob?.cancel()
 
-            Log.d(TAG, "握手完成1，session_id: $sessionId")
-            scope.launch {
-                Log.d(TAG, "握手完成2，session_id: $sessionId")
-                Log.d(TAG, "发送HelloReceived事件")
-                _events.emit(WebSocketEvent.HelloReceived)
-                Log.d(TAG, "发送Connected事件")
-                _events.emit(WebSocketEvent.Connected)
-                Log.d(TAG, "事件发送完成")
-            }
+            Log.d(TAG, "握手成功，session_id: $sessionId")
+            _eventChannel.trySend(WebSocketEvent.HelloReceived)
+            _eventChannel.trySend(WebSocketEvent.Connected)
         } else {
             Log.e(TAG, "服务器返回的transport不匹配: $transport")
-            scope.launch {
-                _events.emit(WebSocketEvent.Error("握手失败：transport不匹配"))
-            }
+            _eventChannel.trySend(WebSocketEvent.Error("握手失败：transport不匹配"))
         }
     }
 
@@ -214,7 +214,7 @@ class WebSocketManager(private val context: Context) {
             delay(HELLO_TIMEOUT)
             if (!isHandshakeComplete) {
                 Log.e(TAG, "Hello握手超时")
-                _events.emit(WebSocketEvent.Error("握手超时"))
+                _eventChannel.trySend(WebSocketEvent.Error("握手超时"))
                 disconnect()
             }
         }
@@ -315,7 +315,7 @@ class WebSocketManager(private val context: Context) {
     fun sendBinaryMessage(data: ByteArray) {
         if (isConnected && isHandshakeComplete && webSocket != null) {
             try {
-                val success = webSocket!!.send(ByteString.of(*data))
+                val success = webSocket!!.send(ByteString.of(data, 0, data.size))
                 if (success) {
                     Log.d(TAG, "发送二进制消息，长度: ${data.size}")
                 } else {
@@ -347,6 +347,7 @@ class WebSocketManager(private val context: Context) {
         isConnected = false
         isHandshakeComplete = false
         sessionId = null
+        _eventChannel.trySend(WebSocketEvent.Disconnected)
         // 清理连接参数
         lastUrl = null
         lastDeviceId = null

@@ -46,11 +46,12 @@ class OpusStreamPlayer(
 
     init {
         val channelConfig = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
-        val bufferSize = AudioTrack.getMinBufferSize(
+        val minBufferSize = AudioTrack.getMinBufferSize(
             sampleRate,
             channelConfig,
             AudioFormat.ENCODING_PCM_16BIT
-        ) * 2 // Increase buffer size
+        )
+        val bufferSize = maxOf(minBufferSize * 4, sampleRate * 2) // 至少可容纳 1 秒音频缓冲，保障平滑流式播放
 
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(

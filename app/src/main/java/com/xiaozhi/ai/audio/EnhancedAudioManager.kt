@@ -17,6 +17,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.flow
+import java.io.ByteArrayOutputStream
 
 /**
  * 音频事件
@@ -34,11 +35,11 @@ class EnhancedAudioManager(private val context: Context) {
     companion object {
         private const val TAG = "EnhancedAudioManager"
         private const val RECORD_SAMPLE_RATE = 16000
-        private const val PLAY_SAMPLE_RATE = 24000
+        private const val PLAY_SAMPLE_RATE = 16000
         private const val CHANNELS = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val FRAME_DURATION_MS = 60
-        private const val FRAME_SIZE = RECORD_SAMPLE_RATE * FRAME_DURATION_MS / 1000 * 2 // 16bit = 2 bytes
+        private const val FRAME_SIZE = RECORD_SAMPLE_RATE * FRAME_DURATION_MS / 1000 * 2 // 16bit = 2 bytes (1920 bytes)
     }
 
     private var audioRecord: AudioRecord? = null
@@ -94,12 +95,13 @@ class EnhancedAudioManager(private val context: Context) {
 
         val bufferSize = AudioRecord.getMinBufferSize(RECORD_SAMPLE_RATE, CHANNELS, AUDIO_FORMAT)
         
+        // 使用 VOICE_RECOGNITION：专为语音识别调优，不进入通话模式，避免听筒抢占与降噪门限将人声当作噪声裁切
         audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
             RECORD_SAMPLE_RATE,
             CHANNELS,
             AUDIO_FORMAT,
-            bufferSize * 2
+            maxOf(bufferSize * 4, FRAME_SIZE * 4)
         )
 
         // 设置AEC和NS
@@ -136,8 +138,9 @@ class EnhancedAudioManager(private val context: Context) {
     }
 
     /**
-     * 确保音频播放工作协程在运行
+     * 确保音频播放工作协程在运行（保持单一协程顺序消费，防止并发交叉播报导致叠字）
      */
+    @Synchronized
     private fun ensurePlaybackJob() {
         if (playbackJob?.isActive == true) return
         playbackJob = scope.launch {
@@ -176,15 +179,43 @@ class EnhancedAudioManager(private val context: Context) {
                 Log.d(TAG, "开始录音")
 
                 scope.launch {
-                    val buffer = ByteArray(FRAME_SIZE)
+                    val readBuffer = ByteArray(FRAME_SIZE)
+                    val accumulator = ByteArrayOutputStream()
+                    var frameCounter = 0L
+
                     while (isRecording) {
-                        val bytesRead = record.read(buffer, 0, buffer.size)
+                        val bytesRead = record.read(readBuffer, 0, readBuffer.size)
                         if (bytesRead > 0) {
-                            // 使用真正的Opus编码器
-                            opusEncoder?.let { encoder ->
-                                val opusData = encoder.encode(buffer.copyOf(bytesRead))
-                                opusData?.let { 
-                                    _audioEvents.emit(AudioEvent.AudioData(it))
+                            // 计算当前块的 RMS 能量
+                            var sumSquares = 0L
+                            val sampleCount = bytesRead / 2
+                            for (i in 0 until bytesRead step 2) {
+                                val sample = ((readBuffer[i].toInt() and 0xFF) or (readBuffer[i + 1].toInt() shl 8)).toShort()
+                                sumSquares += sample * sample
+                            }
+                            val rms = kotlin.math.sqrt((sumSquares.toDouble() / maxOf(1, sampleCount))).toFloat()
+
+                            // 将读取的原始 PCM 字节写入累积器，防止底层驱动以非标准分片返回时导致丢帧
+                            accumulator.write(readBuffer, 0, bytesRead)
+
+                            while (accumulator.size() >= FRAME_SIZE) {
+                                val allBytes = accumulator.toByteArray()
+                                val frameToEncode = allBytes.copyOfRange(0, FRAME_SIZE)
+                                accumulator.reset()
+                                if (allBytes.size > FRAME_SIZE) {
+                                    accumulator.write(allBytes, FRAME_SIZE, allBytes.size - FRAME_SIZE)
+                                }
+
+                                frameCounter++
+                                if (frameCounter % 25 == 0L) {
+                                    Log.d(TAG, "麦克风正在推流: frame=$frameCounter, rms=$rms")
+                                }
+
+                                opusEncoder?.let { encoder ->
+                                    val opusData = encoder.encode(frameToEncode)
+                                    if (opusData != null) {
+                                        _audioEvents.emit(AudioEvent.AudioData(opusData))
+                                    }
                                 }
                             }
                         }
