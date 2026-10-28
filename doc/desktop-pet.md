@@ -281,7 +281,34 @@ jobs:
 * **解决方案与代码沉淀**：
   * 在 `ConversationViewModel.kt` 的 `performOtaCheck()` 中加入保护性校验：仅当本地配置的 `config.websocketUrl.isBlank()` 时才允许采纳 OTA 下发的推荐地址，保障用户自建服务的优先级。
 
-### 6.5 联调网络端点与配置速查表
+### 6.5 故障五：麦克风 ALSA 零散分片被丢弃导致的 ASR 仅识别“嗯”与 LLM 机械复读
+* **表象特征**：用户说话时小智没有任何反应，假装倾听一段时间后，自顾自重复说同一段机械话术（如：“厚！你是只会说嗯的机器人喔？下次约会带我去看夜景...”）。
+* **根本原因分析**：
+  1. **AudioRecord 零散分片导致编码器整帧丢弃**：
+     * 底层驱动（骁龙 660 的 ALSA HAL）一次 `record.read()` 返回的数据大小取决于硬件周期（常见如 320 采样点 / 640 字节）。
+     * 原代码直接将单次读取的字节切片传入 `OpusEncoder.encode()`。编码器严格校验 `pcmData.size == 1920`（60ms 帧长），一旦不等于 1920 即打印 `Input buffer size must be 1920 bytes (got 640/1280)` 并直接返回 `null`。
+     * 日志分析证实高达 85%~90% 的人声数据被硬性丢弃，送入 WebSocket 的音频流只剩下零星声学毛刺。
+  2. **双重 AEC 滤波吞噬人声**：
+     * 原代码使用 `VOICE_COMMUNICATION` 并在其上附加了软件 `AcousticEchoCanceler`。在 LineageOS 21 上，硬件 HAL 与软件 AEC 叠加导致极其激进的人声压制（Ducking），几乎将所有输入削成近乎静音。
+  3. **ASR 误判与 LLM 上下文污染循环**：
+     * 云端千问 ASR 在收到断续且严重衰减的微弱气流后，仅能识别出“嗯。”并写入 Redis 会话记忆；大模型针对多轮“嗯”的历史记录不断生成嗔怒/调侃的夜景约会话术。
+* **解决方案与代码沉淀**：
+  * **引入 PCM 累积器（Accumulator Buffer）**：在 `EnhancedAudioManager.kt` 中使用 `ByteArrayOutputStream` 作为字节累积队列。无论底层 HAL 一次返回 320、640 还是 1280 字节，均追加至累积队列中；只要累积 `>= 1920` 字节，立即精准截取 1920 字节送入 Opus 编码，余下字节保留至下一次循环，彻底实现 0 丢包与连续相位。
+  * **切换音频源至 `VOICE_RECOGNITION`**：避免系统进入 VoIP 通话模式，绕过激进的硬件通话抑噪与听筒路由，拾取针对语音识别优化的高保真人声；同时加入每秒 RMS 声学能量监控。
+
+### 6.6 故障六：WebSocket 线程无序 emit 与采样率不匹配导致的音频“叠字”
+* **表象特征**：小智回答时发音重叠（“叠字”）、字词在时间轴上相互冲突混叠，听不清完整语句。
+* **根本原因分析**：
+  1. **多协程竞争 SharedFlow 导致音频包时序打乱**：
+     * 原 `WebSocketManager.kt` 在 OkHttp 的 `onMessage(webSocket, bytes)` 回调中，对每一个收到的二进制音频包都执行了一次 `scope.launch { _events.emit(BinaryMessage(...)) }`。
+     * `_events` 使用了无额外缓冲的 `MutableSharedFlow`。突发多包到达时，多条协程同时在 `Dispatchers.IO` 上挂起等待消费者收集；协程恢复调度时不具备 FIFO 保证，导致音频帧（如原本 1, 2, 3, 4, 5）以乱序（如 1, 4, 2, 5, 3）送入播放队列，发音前后穿插、叠字错位。
+  2. **端到端采样率倒置重采样**：
+     * 服务端默认在 `hello` 握手协商后输出 16000Hz Opus 流；但客户端 `OpusDecoder` 与 `AudioTrack` 却错误配置为 24000Hz，触发解码层与系统的额外重采样抖动。
+* **解决方案与代码沉淀**：
+  * **使用 `Channel(UNLIMITED)` 同步保序直传**：将 `WebSocketManager` 的事件管道重构为 `Channel<WebSocketEvent>(Channel.UNLIMITED)`，在 OkHttp 回调中直接执行同步非阻塞的 `_eventChannel.trySend()`。彻底移除 `scope.launch`，保证网络层到达的二进制帧 100% 按照 TCP 字节序单向 FIFO 投递。
+  * **全链路 16000Hz 原生对齐**：将 `PLAY_SAMPLE_RATE`、`RECORD_SAMPLE_RATE`、`OpusDecoder` 与 `AudioTrack` 统一定为 16000Hz，与服务端 Opus 格式 1:1 无损对齐；解码缓冲区扩大至 3840 字节，彻底杜绝解码溢出与叠字破音。
+
+### 6.7 联调网络端点与配置速查表
 
 | 组件 / 服务 | 端点地址 / 规格 | 说明 |
 | :--- | :--- | :--- |
