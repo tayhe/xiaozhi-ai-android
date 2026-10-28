@@ -8,6 +8,7 @@ plugins {
 android {
     namespace = "com.xiaozhi.ai"
     compileSdk = 35
+    ndkVersion = System.getenv("ANDROID_NDK_VERSION") ?: "27.0.12077973"
 
     defaultConfig {
         applicationId = "com.xiaozhi.ai"

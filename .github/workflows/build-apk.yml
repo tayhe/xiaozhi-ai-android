@@ -27,15 +27,23 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      # 动态绑定 Runner 预装的最新 Android NDK
+      # 动态配置与 AGP 兼容的 Android NDK 并同步版本号
       - name: Configure Android NDK
         run: |
-          LATEST_NDK=$(ls -d $ANDROID_SDK_ROOT/ndk/* 2>/dev/null | sort -V | tail -n 1)
-          if [ -n "$LATEST_NDK" ]; then
-            echo "Found Android NDK at: $LATEST_NDK"
-            echo "ANDROID_NDK_HOME=$LATEST_NDK" >> $GITHUB_ENV
-            echo "ndk.dir=$LATEST_NDK" >> local.properties
+          echo "Available NDKs in $ANDROID_SDK_ROOT/ndk:"
+          ls -la $ANDROID_SDK_ROOT/ndk/ || true
+          TARGET_NDK=$(ls -d $ANDROID_SDK_ROOT/ndk/27.* 2>/dev/null | tail -n 1)
+          if [ -z "$TARGET_NDK" ]; then
+            TARGET_NDK=$(ls -d $ANDROID_SDK_ROOT/ndk/26.* 2>/dev/null | tail -n 1)
           fi
+          if [ -z "$TARGET_NDK" ]; then
+            TARGET_NDK=$(ls -d $ANDROID_SDK_ROOT/ndk/* 2>/dev/null | sort -V | tail -n 1)
+          fi
+          NDK_VER=$(basename "$TARGET_NDK")
+          echo "Selected NDK: $NDK_VER at $TARGET_NDK"
+          echo "ANDROID_NDK_HOME=$TARGET_NDK" >> $GITHUB_ENV
+          echo "ANDROID_NDK_VERSION=$NDK_VER" >> $GITHUB_ENV
+          echo "ndk.dir=$TARGET_NDK" >> local.properties
 
       - name: Grant Execute Permission to Gradlew
         run: chmod +x gradlew
