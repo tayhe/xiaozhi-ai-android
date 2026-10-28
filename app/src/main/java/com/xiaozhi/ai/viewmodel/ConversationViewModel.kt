@@ -572,7 +572,7 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
                 Log.e(TAG, "等待TTS播放完成出错", e)
             } finally {
                 audioManager.stopPlaying()
-                if (_state.value == ConversationState.SPEAKING) {
+                if (_state.value == ConversationState.SPEAKING || _state.value == ConversationState.PROCESSING) {
                     if (isAutoMode) {
                         startNextRound()
                     } else {

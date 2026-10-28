@@ -308,7 +308,28 @@ jobs:
   * **使用 `Channel(UNLIMITED)` 同步保序直传**：将 `WebSocketManager` 的事件管道重构为 `Channel<WebSocketEvent>(Channel.UNLIMITED)`，在 OkHttp 回调中直接执行同步非阻塞的 `_eventChannel.trySend()`。彻底移除 `scope.launch`，保证网络层到达的二进制帧 100% 按照 TCP 字节序单向 FIFO 投递。
   * **全链路 16000Hz 原生对齐**：将 `PLAY_SAMPLE_RATE`、`RECORD_SAMPLE_RATE`、`OpusDecoder` 与 `AudioTrack` 统一定为 16000Hz，与服务端 Opus 格式 1:1 无损对齐；解码缓冲区扩大至 3840 字节，彻底杜绝解码溢出与叠字破音。
 
-### 6.7 联调网络端点与配置速查表
+### 6.7 故障七：服务端 VAD 400ms 过短静音阈值引起的误断句（“嗯”丢字）与虚假长延时
+* **表象特征**：
+  1. 用户自然口语交谈中若先发出单字叹词或语气词（如“嗯……”、“那个……”），思考停顿稍长（约 400~500ms）后，小智立即抢答打断并抱怨“你只回了一个嗯字太敷衍了”，用户后续接着说的整句话全部丢失。
+  2. 服务端埋点日志显示 `asr_silence_final` 经常高达 7000ms 甚至 14000ms+，用户感知每次说完话到小智回答之间等待时间偏长。
+* **根本原因分析**：
+  1. **服务端静音收口阈值过紧（`chat_max_silence_duration: 400`）**：
+     * 中文自然口语交谈中，发语叹词（通常持续 100~200ms）与主句之间的思考停顿，或句子中间的换气逗号，普遍处于 400ms~600ms 区间。
+     * 服务端此前配置的 `chat_max_silence_duration: 400` 过紧。用户发出“嗯”后仅停顿 420ms，便被服务端的本地 VAD（`ten_vad`）判定为整句结束（日志见 `asr.go:507 判定语音结束: idle=420ms, voice_duration_in_session=120ms`），强行触发 `OnVoiceSilence()`。
+  2. **过早断句引发的音频硬性丢弃与客户端状态切换**：
+     * 服务端触发 `OnVoiceSilence()` 后，立即将客户端状态置为 `ClientVoiceStop = true`。此时用户本意是继续说话，但服务端后续收到的所有音频包均被 `chat.go:414` 打印 `客户端停止说话, 跳过音频数据` 并全部丢弃。
+     * 服务端向客户端下发 `{"type": "stt", "text": "嗯。"}`；Android 客户端收到 `stt` 消息后，将界面置为 `PROCESSING` 并执行 `audioManager.stopRecording()` 彻底关闭麦克风，导致用户后续声音全部丢失。
+  3. **超长耗时（7s~15s）的指标假象**：
+     * 日志分析证实，服务端在用户刚发出“嗯”并停顿 420ms 时就盖下了 `voiceSilenceTs` 静音时间戳；而用户实际上仍在说话，等到用户真正把整段话说完、DashScope 返回最终转录时才盖下 `asrFinalTextTs`。
+     * 指标统计插件计算 `asr_silence_final = asrFinalTextTs - voiceSilenceTs`，算出了高达 7351ms、14105ms、16809ms 的虚假超长耗时。
+* **解决方案与代码沉淀**：
+  1. **放宽服务端自然静音收口阈值至 800ms**：
+     * 修改 Instabox 服务端 `config/config.yaml`：将 `chat.chat_max_silence_duration` 从 `400` 调整为 `800`，并配置 `pre_asr_text_silence_duration: 1200`。
+     * 为发语叹词、逗号停顿和思考换气提供充足的人性化缓冲空间，彻底杜绝单字断句误判。
+  2. **客户端状态机容错健全**：
+     * 在 `ConversationViewModel.kt` 的 `handleTtsStop()` 中，将下一轮对话触发条件放宽为 `_state.value == ConversationState.SPEAKING || _state.value == ConversationState.PROCESSING`，确保即使遇到极短音频或快速 TTS，客户端也不会卡死在 PROCESSING 状态。
+
+### 6.8 联调网络端点与配置速查表
 
 | 组件 / 服务 | 端点地址 / 规格 | 说明 |
 | :--- | :--- | :--- |
