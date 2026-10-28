@@ -16,6 +16,8 @@ import com.xiaozhi.ai.data.XiaozhiConfig
 import com.xiaozhi.ai.network.WebSocketEvent
 import com.xiaozhi.ai.network.WebSocketManager
 import com.xiaozhi.ai.network.OtaService
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
@@ -74,6 +76,7 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
     // 多轮对话支持
     private var isAutoMode = false
     private var currentUserMessage: String? = null
+    private var ttsWaitJob: Job? = null
 
     // 音频初始化状态
     private var isAudioInitialized = false
@@ -335,6 +338,8 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
 
             is WebSocketEvent.Disconnected -> {
                 Log.d(TAG, "WebSocket连接断开")
+                ttsWaitJob?.cancel()
+                ttsWaitJob = null
                 _isConnected.value = false
                 _state.value = ConversationState.IDLE
                 audioManager.stopRecording()
@@ -355,6 +360,8 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
 
             is WebSocketEvent.Error -> {
                 Log.e(TAG, "WebSocket错误: ${event.error}")
+                ttsWaitJob?.cancel()
+                ttsWaitJob = null
                 _errorMessage.value = event.error
                 _state.value = ConversationState.IDLE
                 audioManager.stopRecording()
@@ -424,22 +431,15 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
                         }
                         "start" -> {
                             // TTS开始播放
+                            ttsWaitJob?.cancel()
+                            ttsWaitJob = null
                             _state.value = ConversationState.SPEAKING
                             Log.d(TAG, "开始TTS播放")
                         }
                         "stop" -> {
-                            // TTS播放结束
-                            audioManager.stopPlaying()
-                            Log.d(TAG, "TTS播放结束")
-                            
-                            // 根据模式决定下一步
-                            if (isAutoMode) {
-                                // 自动模式：继续下一轮对话
-                                startNextRound()
-                            } else {
-                                // 手动模式：回到空闲状态
-                                _state.value = ConversationState.IDLE
-                            }
+                            // TTS服务端下发完成，启动等待客户端实际音频播放完毕
+                            Log.d(TAG, "TTS服务端下发完成，等待客户端音频播放完毕...")
+                            handleTtsStop()
                         }
                     }
                 }
@@ -481,7 +481,16 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
      * 开始聆听（手动模式）
      */
     fun startListening() {
-        if (_state.value != ConversationState.IDLE || !_isConnected.value) {
+        if (!_isConnected.value) {
+            return
+        }
+        // 如果正在播放，允许用户主动打断并切换为聆听
+        if (_state.value == ConversationState.SPEAKING) {
+            ttsWaitJob?.cancel()
+            ttsWaitJob = null
+            audioManager.stopPlaying()
+            webSocketManager.sendAbort("user_interrupt")
+        } else if (_state.value != ConversationState.IDLE) {
             return
         }
 
@@ -532,6 +541,8 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
      * 用于上滑取消等场景：立即停止录音、停止Opus数据传输，并发送 type=abort 给服务器。
      */
     fun cancelListeningWithAbort(reason: String = "user_interrupt") {
+        ttsWaitJob?.cancel()
+        ttsWaitJob = null
         // 将状态置为IDLE，确保 handleAudioEvent 不再发送后续音频帧
         if (_state.value == ConversationState.LISTENING) {
             _state.value = ConversationState.IDLE
@@ -543,6 +554,33 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
         webSocketManager.sendAbort(reason)
 
         Log.d(TAG, "取消录音并发送中止: $reason")
+    }
+
+    /**
+     * 处理 TTS 服务端发送 stop 后的客户端音频播放与等待
+     */
+    private fun handleTtsStop() {
+        ttsWaitJob?.cancel()
+        ttsWaitJob = viewModelScope.launch {
+            try {
+                // 等待客户端播放队列与底层 AudioTrack 彻底把音频播完
+                audioManager.waitForPlaybackCompletion()
+                // 留出 300ms 缓冲，确保喇叭声波与混响彻底消失，防止麦克风自激
+                delay(300)
+                Log.d(TAG, "TTS音频实际播放完成")
+            } catch (e: Exception) {
+                Log.e(TAG, "等待TTS播放完成出错", e)
+            } finally {
+                audioManager.stopPlaying()
+                if (_state.value == ConversationState.SPEAKING) {
+                    if (isAutoMode) {
+                        startNextRound()
+                    } else {
+                        _state.value = ConversationState.IDLE
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -588,6 +626,8 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
      * 打断当前对话
      */
     fun interrupt() {
+        ttsWaitJob?.cancel()
+        ttsWaitJob = null
         audioManager.stopPlaying()
         audioManager.stopRecording()
         
@@ -605,6 +645,8 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
      */
     fun disconnect() {
         Log.d(TAG, "正在断开连接...")
+        ttsWaitJob?.cancel()
+        ttsWaitJob = null
         audioManager.stopRecording()
         audioManager.stopPlaying()
         webSocketManager.disconnect()
@@ -655,6 +697,8 @@ class ConversationViewModel(application: Application) : AndroidViewModel(applica
      * 停止自动对话模式
      */
     fun stopAutoConversation() {
+        ttsWaitJob?.cancel()
+        ttsWaitJob = null
         isAutoMode = false
         audioManager.stopRecording()
         audioManager.stopPlaying()

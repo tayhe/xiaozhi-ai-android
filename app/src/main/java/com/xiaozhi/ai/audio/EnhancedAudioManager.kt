@@ -13,6 +13,7 @@ import com.xiaozhi.ai.audio.utils.OpusDecoder
 import com.xiaozhi.ai.audio.utils.OpusEncoder
 import com.xiaozhi.ai.audio.utils.OpusStreamPlayer
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.flow
@@ -57,10 +58,9 @@ class EnhancedAudioManager(private val context: Context) {
     private var opusDecoder: OpusDecoder? = null
     private var streamPlayer: OpusStreamPlayer? = null
     
-    // 音频播放流
-    private val _audioPlaybackFlow = MutableSharedFlow<ByteArray>()
+    // 音频播放队列 (Channel 保证严格 FIFO 与非阻塞投递)
+    private val playbackChannel = Channel<ByteArray>(Channel.UNLIMITED)
     private var playbackJob: Job? = null
-    private var isPlaybackSetup = false
 
     /**
      * 初始化音频系统
@@ -74,7 +74,7 @@ class EnhancedAudioManager(private val context: Context) {
             streamPlayer = OpusStreamPlayer(PLAY_SAMPLE_RATE, 1, FRAME_DURATION_MS, context)
             
             setupAudioRecord()
-            // 不在初始化时启动播放流，而是在需要时启动
+            ensurePlaybackJob()
             Log.d(TAG, "增强版音频系统初始化成功")
             true
         } catch (e: Exception) {
@@ -136,38 +136,31 @@ class EnhancedAudioManager(private val context: Context) {
     }
 
     /**
-     * 设置音频播放流
+     * 确保音频播放工作协程在运行
      */
-    private fun setupAudioPlayback() {
-        // 防止重复设置播放流
-        if (isPlaybackSetup) {
-            Log.d(TAG, "播放流已经设置，跳过重复设置")
-            return
-        }
-        
-        isPlaybackSetup = true
-        Log.d(TAG, "首次设置音频播放流")
-        
-        // 创建持续的PCM数据流
-        val pcmFlow = flow {
-            _audioPlaybackFlow.collect { opusData ->
-                try {
-                    opusDecoder?.let { decoder ->
-                        val pcmData = decoder.decode(opusData)
-                        pcmData?.let { 
-                            emit(it)
-                            Log.d(TAG, "解码音频数据，PCM大小: ${it.size}")
+    private fun ensurePlaybackJob() {
+        if (playbackJob?.isActive == true) return
+        playbackJob = scope.launch {
+            try {
+                for (opusData in playbackChannel) {
+                    if (!isActive) break
+                    try {
+                        opusDecoder?.let { decoder ->
+                            val pcmData = decoder.decode(opusData)
+                            if (pcmData != null && pcmData.isNotEmpty()) {
+                                streamPlayer?.write(pcmData)
+                            }
                         }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "解码或写入音频失败", e)
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "解码音频数据失败", e)
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "音频播放工作协程异常", e)
+            } finally {
+                isPlayingState = false
             }
         }
-        
-        // 启动播放器
-        streamPlayer?.start(pcmFlow)
-        Log.d(TAG, "音频播放流已设置并启动")
     }
 
     /**
@@ -218,47 +211,36 @@ class EnhancedAudioManager(private val context: Context) {
     }
 
     /**
-     * 播放音频数据（单次播放）
+     * 播放音频数据（流式分片投递）
      */
     fun playAudio(audioData: ByteArray) {
-        scope.launch {
-            try {
-                // 确保播放器已经启动
-                if (!isPlayingState) {
-                    isPlayingState = true
-                    Log.d(TAG, "首次播放音频，设置播放流")
-                    setupAudioPlayback()
-                }
-                
-                // 直接发送到播放流
-                _audioPlaybackFlow.emit(audioData)
-                Log.d(TAG, "发送音频数据到播放流，长度: ${audioData.size}")
-            } catch (e: Exception) {
-                Log.e(TAG, "播放音频失败", e)
-            }
-        }
+        ensurePlaybackJob()
+        isPlayingState = true
+        playbackChannel.trySend(audioData)
     }
 
     /**
-     * 停止播放
+     * 停止播放（清空排队数据并暂停底层播放器）
      */
     fun stopPlaying() {
         isPlayingState = false
-        isPlaybackSetup = false
+        // 清空尚未解码的音频分片（用于打断或中止）
+        while (playbackChannel.tryReceive().isSuccess) {
+            // drain
+        }
         streamPlayer?.stop()
-        
-        Log.d(TAG, "停止播放并重置状态")
+        Log.d(TAG, "停止播放并清空音频队列")
     }
 
     /**
      * 开始流式播放
      */
     fun startStreamPlayback(opusDataFlow: SharedFlow<ByteArray>) {
-        playbackJob?.cancel()
-        playbackJob = scope.launch {
-            isPlayingState = true
+        ensurePlaybackJob()
+        isPlayingState = true
+        scope.launch {
             opusDataFlow.collect { opusData ->
-                _audioPlaybackFlow.emit(opusData)
+                playbackChannel.trySend(opusData)
             }
         }
         Log.d(TAG, "开始流式播放")
@@ -268,19 +250,22 @@ class EnhancedAudioManager(private val context: Context) {
      * 停止流式播放
      */
     fun stopStreamPlayback() {
-        isPlayingState = false
-        isPlaybackSetup = false
-        playbackJob?.cancel()
-        streamPlayer?.stop()
-        
-        Log.d(TAG, "停止流式播放并重置状态")
+        stopPlaying()
     }
 
     /**
-     * 等待播放完成
+     * 等待所有待播放音频完全播放完成
      */
     suspend fun waitForPlaybackCompletion() {
+        // 1. 等待 Channel 中的所有数据包被解码并写入底层播放器
+        while (!playbackChannel.isEmpty) {
+            delay(20)
+        }
+        // 2. 短暂等待确保最后一帧写入 AudioTrack
+        delay(50)
+        // 3. 等待 AudioTrack 中的音频全部播放完毕
         streamPlayer?.waitForPlaybackCompletion()
+        isPlayingState = false
     }
 
     /**
@@ -298,7 +283,9 @@ class EnhancedAudioManager(private val context: Context) {
      */
     fun cleanup() {
         stopRecording()
-        stopStreamPlayback()
+        stopPlaying()
+        playbackJob?.cancel()
+        playbackChannel.close()
         
         acousticEchoCanceler?.release()
         noiseSuppressor?.release()

@@ -2,6 +2,7 @@ package com.xiaozhi.ai.audio.utils
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -36,6 +37,12 @@ class OpusStreamPlayer(
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
     private var hasAudioFocus = false
+
+    // 播放进度与帧计数追踪
+    @Volatile
+    private var totalWrittenFrames = 0L
+    @Volatile
+    private var startHeadPosition = 0L
 
     init {
         val channelConfig = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
@@ -141,42 +148,92 @@ class OpusStreamPlayer(
         }
     }
 
-    fun start(pcmFlow: Flow<ByteArray?>) {
-        // 如果已经在播放，不要重新启动
+    /**
+     * 确保音频通过底部外放扬声器输出，防止通话模式下被系统误路由到听筒
+     */
+    fun ensureSpeakerphone() {
+        audioManager?.let { am ->
+            try {
+                am.isSpeakerphoneOn = true
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val devices = am.availableCommunicationDevices
+                    val speaker = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                    if (speaker != null) {
+                        am.setCommunicationDevice(speaker)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "设置扬声器失败: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 启动播放准备（无参）
+     */
+    fun start() {
         if (isPlaying) {
-            Log.d(TAG, "播放器已经在运行，跳过重新启动")
             return
         }
-        
-        // 取消之前的播放任务
-        playbackJob?.cancel()
-        
-        // 请求音频焦点
-        if (!requestAudioFocus()) {
-            Log.e(TAG, "无法获得音频焦点，播放可能会失败")
-        }
+        requestAudioFocus()
+        ensureSpeakerphone()
         
         isPlaying = true
         if (audioTrack.state == AudioTrack.STATE_INITIALIZED) {
-            audioTrack.play()
-            Log.d(TAG, "AudioTrack开始播放，状态: ${audioTrack.playState}")
+            try {
+                audioTrack.play()
+                startHeadPosition = audioTrack.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+                totalWrittenFrames = 0L
+                Log.d(TAG, "AudioTrack开始播放, startHeadPosition: $startHeadPosition")
+            } catch (e: Exception) {
+                Log.e(TAG, "AudioTrack启动播放异常", e)
+                isPlaying = false
+            }
         } else {
             Log.e(TAG, "AudioTrack未初始化，状态: ${audioTrack.state}")
             isPlaying = false
-            return
         }
+    }
 
+    /**
+     * 写入解码后的 PCM 数据到 AudioTrack
+     */
+    fun write(pcmData: ByteArray): Int {
+        if (!isPlaying) {
+            start()
+        }
+        if (audioTrack.state != AudioTrack.STATE_INITIALIZED) {
+            return -1
+        }
+        if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            try {
+                audioTrack.play()
+            } catch (e: Exception) {
+                Log.e(TAG, "恢复AudioTrack播放失败", e)
+            }
+        }
+        val bytesWritten = audioTrack.write(pcmData, 0, pcmData.size)
+        if (bytesWritten > 0) {
+            val frames = bytesWritten / (channels * 2)
+            totalWrittenFrames += frames
+        } else {
+            Log.e(TAG, "AudioTrack写入失败: $bytesWritten")
+        }
+        return bytesWritten
+    }
+
+    /**
+     * 支持 Flow 流式播放（兼容示例与已有调用）
+     */
+    fun start(pcmFlow: Flow<ByteArray?>) {
+        start()
+        playbackJob?.cancel()
         playbackJob = playerScope.launch {
             try {
                 Log.d(TAG, "开始收集PCM数据流")
                 pcmFlow.collect { pcmData ->
                     if (isPlaying && pcmData != null) {
-                        val bytesWritten = audioTrack.write(pcmData, 0, pcmData.size)
-                        if (bytesWritten < 0) {
-                            Log.e(TAG, "AudioTrack写入失败: $bytesWritten")
-                        } else {
-                            Log.d(TAG, "AudioTrack写入成功: $bytesWritten bytes")
-                        }
+                        write(pcmData)
                     }
                 }
                 Log.d(TAG, "PCM数据流收集完成")
@@ -188,6 +245,9 @@ class OpusStreamPlayer(
         }
     }
 
+    /**
+     * 立即停止播放并清空硬件缓冲（用于用户打断、挂断等立即静音场景）
+     */
     fun stop() {
         if (isPlaying) {
             isPlaying = false
@@ -195,27 +255,56 @@ class OpusStreamPlayer(
             playbackJob = null
             
             if (audioTrack.state == AudioTrack.STATE_INITIALIZED) {
-                audioTrack.stop()
-                Log.d(TAG, "AudioTrack停止播放")
+                try {
+                    audioTrack.pause()
+                    audioTrack.flush()
+                    Log.d(TAG, "AudioTrack已暂停并清空缓冲")
+                } catch (e: Exception) {
+                    Log.e(TAG, "停止AudioTrack失败", e)
+                }
             }
+            totalWrittenFrames = 0L
             abandonAudioFocus()
         }
     }
 
     fun release() {
         stop()
-        playbackJob?.cancel()
-        playbackJob = null
         audioTrack.release()
         playerScope.cancel()
     }
 
-    suspend fun waitForPlaybackCompletion() {
-        var position = 0
-        while (audioTrack.playState == AudioTrack.PLAYSTATE_PLAYING && audioTrack.playbackHeadPosition != position) {
-            Log.i(TAG, "audioTrack.playState: ${audioTrack.playState}, playbackHeadPosition: ${audioTrack.playbackHeadPosition}")
-            position = audioTrack.playbackHeadPosition
-            delay(100) // 检查间隔
+    /**
+     * 等待所有已写入 AudioTrack 的音频帧完全播放完毕
+     * @param timeoutMs 最大超时时间，防止底层驱动卡死
+     */
+    suspend fun waitForPlaybackCompletion(timeoutMs: Long = 30000) {
+        if (!isPlaying || totalWrittenFrames == 0L) {
+            return
+        }
+        val startTime = System.currentTimeMillis()
+        Log.d(TAG, "开始等待音频播放完成: targetTotalFrames=$totalWrittenFrames, startHeadPos=$startHeadPosition")
+        
+        while (isPlaying) {
+            val currentHeadPos = audioTrack.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+            val playedFrames = if (currentHeadPos >= startHeadPosition) {
+                currentHeadPos - startHeadPosition
+            } else {
+                // 说明底层驱动 reset 回 0
+                currentHeadPos
+            }
+            
+            if (playedFrames >= totalWrittenFrames) {
+                Log.d(TAG, "所有音频帧播放完毕: playedFrames=$playedFrames, targetTotalFrames=$totalWrittenFrames")
+                break
+            }
+            
+            if (System.currentTimeMillis() - startTime > timeoutMs) {
+                Log.w(TAG, "等待音频播放超时: playedFrames=$playedFrames, targetTotalFrames=$totalWrittenFrames")
+                break
+            }
+            
+            delay(30)
         }
     }
 
