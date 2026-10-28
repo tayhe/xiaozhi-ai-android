@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import okhttp3.*
 import okio.ByteString
+import okio.ByteString.Companion.toByteString
 import java.util.concurrent.TimeUnit
 
 /**
@@ -315,7 +316,7 @@ class WebSocketManager(private val context: Context) {
     fun sendBinaryMessage(data: ByteArray) {
         if (isConnected && isHandshakeComplete && webSocket != null) {
             try {
-                val success = webSocket!!.send(ByteString.of(data, 0, data.size))
+                val success = webSocket!!.send(data.toByteString(0, data.size))
                 if (success) {
                     Log.d(TAG, "发送二进制消息，长度: ${data.size}")
                 } else {
