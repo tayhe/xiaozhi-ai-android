@@ -147,10 +147,15 @@ class WebSocketManager(private val context: Context) {
         }
 
         Log.d(TAG, "连接异常断开，准备自动重连...")
-        scope.launch {
-            if (lastUrl != null && lastDeviceId != null && lastToken != null) {
+        val url = lastUrl
+        val devId = lastDeviceId
+        val token = lastToken
+        if (url != null && devId != null && token != null) {
+            scope.launch {
                 delay(RECONNECT_DELAY)
-                connect(lastUrl!!, lastDeviceId!!, lastToken!!)
+                if (shouldReconnect) {
+                    connect(url, devId, token)
+                }
             }
         }
     }
